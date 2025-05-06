@@ -1,1 +1,1 @@
-Assignment Codes and Project code(Final project was on mobile Manipulator, in ), for the couorse CL686-Advanced Process Control at IIT Bombay, taught by Prof. Mani Bhushan.
+Assignment Codes and Project code(Final project was on mobile Manipulator, in CL686/Project/Mobile manipulator v1 2), for the course CL686-Advanced Process Control at IIT Bombay, taught by Prof. Mani Bhushan.
