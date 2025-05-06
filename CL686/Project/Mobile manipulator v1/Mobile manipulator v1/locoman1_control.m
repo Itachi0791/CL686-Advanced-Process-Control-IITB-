@@ -1,0 +1,208 @@
+clc; clear; close all;
+
+%% System Parameters
+m1 = 1; % Mass of link 1
+m2 = 1; % Mass of link 2
+m3 = 1; % Mass of link 3
+l1 = 1; % Length of link 1
+l2 = 1; % Length of link 2
+l3 = 1; % Length of link 3
+g = 0; % Acceleration due to gravity 
+I1 = (m1*l1^2)/12; % Moment of inertia of link 1 about COM 
+I2 = (m2*l2^2)/12; % Moment of inertia of link 2 about COM
+I3 = (m3*l3^2)/12; % Moment of inertia of link 3 about COM
+lc1 = (l1/2); % Location of COM of link 1
+lc2 = (l2/2); % Location of COM of link 2
+lc3 = (l3/2); % Location of COM of link 3
+params = struct('m1', m1,'m2', m2, 'm3', m3,'l1', l1, 'l2', l2, 'l3', l3, 'g', g, ...
+    'I1', I1, 'I2', I2, 'I3', I3, 'lc1', lc1, 'lc2', lc2, 'lc3', lc3 ...
+     );
+
+T = 0.08; % Time step
+Ns = 1000; % No. of Time Steps
+Tmax = Ns*T; % Maximum time
+
+tspan = 0:T:Tmax; % Time duration for the simulation
+
+%% MPC Parameters
+p = 50; % Prediction Horizon   
+q = 25; % Control Horizon
+n = 8; % No. of states (including base and manipulator states)
+m = 3; % No. of control inputs (u1, u2, u3)
+
+x0 = zeros(n,1); % Initial state
+
+% State and Control Weights
+wx = eye(n); % State Weights matrix
+wu = 0.01 * eye(m); % Control weights matrix
+
+% Control input constraints
+U_L = -20 * ones(m, 1); 
+U_H = 20 * ones(m, 1); 
+
+% Control change constraints
+delU_L = -1 * ones(m, 1); 
+delU_H = 1 * ones(m, 1); 
+
+% State constraints
+X_L = -10 * ones(n, 1); 
+X_H = 10 * ones(n, 1); 
+
+% MPC Constant matrices
+Wx = kron(eye(p), wx); % State weights matrix
+Wu = kron(eye(p), wu); % Control weights matrix
+Lambda = zeros(m * p, m * p); 
+Lambda_0 = [eye(m); zeros((p - 1) * m, m)]; % Matrices in change of control input inequalities
+Lambda(1:m, 1:m) = eye(m);
+for k = 2:p
+    Lambda((k - 1) * m + 1:k * m, (k - 2) * m + 1:(k - 1) * m) = -eye(m);
+    Lambda((k - 1) * m + 1:k * m, (k - 1) * m + 1:k * m) = eye(m);
+end
+Utilde_L = repmat(U_L, p, 1); 
+Utilde_H = repmat(U_H, p, 1); 
+Xtilde_L = repmat(X_L, p, 1); 
+Xtilde_H = repmat(X_H, p, 1); 
+DeltaU_L = repmat(delU_L, p, 1); 
+DeltaU_H = repmat(delU_H, p, 1); 
+
+Aeq = zeros(m * (p - q), m * p); 
+for i = 1:(p - q)
+    Aeq((i - 1) * m + 1:i * m, (q - 1) * m + 1:q * m) = eye(m);
+    Aeq((i - 1) * m + 1:i * m, (q + i - 1) * m + 1:(q + i) * m) = -eye(m);
+end    
+beq = zeros(m * (p - q), 1);
+
+A_inequality = @(Su) [eye(m * p); Lambda; Su; -eye(m * p); -Lambda; -Su];
+b_inequality = @(x_k, u_kminus1, Del_k, Sx, Sdel) [Utilde_H; DeltaU_H + Lambda_0 * u_kminus1; Xtilde_H - Sx * x_k - Sdel * Del_k; ...
+                                         -Utilde_L; -DeltaU_L - Lambda_0 * u_kminus1; -Xtilde_L + Sx * x_k + Sdel * Del_k];
+
+%% MPC simulation
+X = zeros(n, Ns + 1); 
+U = zeros(m, Ns); 
+X(:, 1) = x0; 
+Xs = [pi/2*ones(size(tspan));pi/2*ones(size(tspan));ones(size(tspan));ones(size(tspan));0*ones(size(tspan));0*ones(size(tspan));0*ones(size(tspan));0*ones(size(tspan))];
+Ufk_prev = zeros(m * p, 1);
+options_ode = odeset('abstol', 1e-9, 'reltol', 1e-9);
+options = optimoptions('quadprog', 'Algorithm', 'active-set', 'Display', 'off');
+% First step simulation with U(0) = 0
+[~,Y] = ode45(@(t,Z) dyn(Z,U(:,1),params),[0,T],X(:,1),options_ode); 
+X(:,2) = (Y(end,:))';
+
+fprintf("Starting MPC Computation : \n")
+for k = 2:Ns
+    % To display progress
+    if mod(k, round(Ns / 5)) == 0
+        fprintf('%d / %d iterations done\n', k, Ns);
+    end
+    
+    % Substitute values into A and B
+    A_mat = A_matrix(X(:, k), U(:, k-1),params);
+    B_mat = B_matrix(X(:, k), U(:, k-1),params);
+    Phi_mat = expm(A_mat * T);
+    Gamma_mat = Gamma_matrix(A_mat, B_mat, T, n, m);
+    del_k = T * dyn(X(:,k),U(:,k-1),params)+ X(:,k) -Phi_mat*X(:,k)-Gamma_mat*U(:,k-1);
+    Del_k = repmat(del_k, p, 1);
+    Zs = repmat(Xs(:,k), p, 1);
+    
+    [Sx, Su, Sdel, H, F] = MPC_matrices(Phi_mat, Gamma_mat, p, Wx, Wu, X(:, k), Del_k, Zs);
+    A_ineq = A_inequality(Su);
+    b_ineq = b_inequality(X(:, k), U(:, k-1), Del_k, Sx, Sdel);
+    
+    Ufk = quadprog(H, F, A_ineq, b_ineq, Aeq, beq, [], [], Ufk_prev, options);
+    U(:, k) = Lambda_0' * Ufk;
+    
+    % Simulate the system forward
+    [~, Y] =  ode45(@(t,Z) dyn(Z,U(:,k),params),[0,T],X(:,k),options_ode);
+    X(:, k + 1) = (Y(end, :))';
+    
+    % Update previous control input
+    Ufk_prev = Ufk;
+end
+
+%% Animation
+figure;
+axis equal; grid on; hold on;
+xlim([-10, 10]); ylim([-10, 10]);
+xlabel('X Position (m)'); ylabel('Y Position (m)');
+title('Loco-Manipulator Animation');
+
+for i = 1:10:length(tspan)
+    x1 = X(3, i) + l1 * cos(X(1, i));
+    y1 = X(4, i) + l1 * sin(X(1, i));
+    x2 = x1 + l2 * cos(X(1, i) + X(2, i));
+    y2 = y1 + l2 * sin(X(1, i) + X(2, i));
+    
+    scatter(X(3, i), X(4, i), 200, "black", "filled")
+    hold on
+    plot([X(3, i), x1], [X(4, i), y1], 'r-o', 'LineWidth', 5)
+    hold on
+    plot([x1, x2], [y1, y2], 'b-o', 'LineWidth', 5)
+
+
+    grid on, set(gca, 'FontSize', 15)
+    axis([-10, 10, -10, 10])
+    axis equal
+    xlabel('$x$', 'Interpreter', 'latex')
+    ylabel('$y$', 'Interpreter', 'latex')
+    title('Animation', 'Interpreter', 'latex')
+    time = Tmax * (i - 1) / (length(tspan) - 1);
+    subtitle("Time = " + time + " sec", 'Interpreter', 'latex')
+    hold off
+
+    pause(0.01)
+end
+
+%% Plots
+figure;
+subplot(2, 2, 1); % Subplot for q1
+plot(tspan, X(1, 1:end), 'b', 'LineWidth', 1.5); % Plot q1
+xlabel('Time (s)');
+ylabel('q1 (rad)');
+title('State q1');
+grid on;
+
+subplot(2, 2, 2); % Subplot for q2
+plot(tspan, X(2, 1:end), 'b', 'LineWidth', 1.5); % Plot q2
+xlabel('Time (s)');
+ylabel('q2 (rad)');
+title('State q2');
+grid on;
+
+subplot(2, 2, 3); % Subplot for u1
+stairs(tspan(1:end-1), U(1, :), 'g', 'LineWidth', 1.5); % Plot u1
+xlabel('Time (s)');
+ylabel('u1 (Nm)');
+title('Control Input u1');
+grid on;
+
+subplot(2, 2, 4); % Subplot for u2
+stairs(tspan(1:end-1), U(2, :), 'g', 'LineWidth', 1.5); % Plot u2
+xlabel('Time (s)');
+ylabel('u2 (Nm)');
+title('Control Input u2');
+grid on;
+%% Helper Functions
+
+function Gamma = Gamma_matrix(A_matrix, B, T, n, m)
+    if det(A_matrix) > 1e-10
+        Gamma = (expm(A_matrix * T) - eye(n)) * pinv(A_matrix) * B;
+    else
+        ode_func = @(tau, x) reshape(expm(A_matrix * tau) * B, [], 1);
+        [~, Y] = ode45(ode_func, [0, T], zeros(n * m, 1));
+        Gamma = reshape(Y(end, :)', n, m);
+    end
+end
+
+function [Sx,Su,Sdel,H,F] = MPC_matrices(Phi_mat,Gamma_mat,p,Wx,Wu,x_k,Del_k,Zs)
+    n = size(Phi_mat,1); m = size(Gamma_mat,2);
+    Sx = zeros(n*p,n); Su = zeros(n*p, m*p); Sdel = zeros(n*p,n*p); % Matrices in equality constraint, X = Sx*x(k) + Su*Uf,k + Sdelta*Deltak
+    for i = 1:p
+        Sx(n*(i-1)+1:n*i,1:n) = Phi_mat^i; 
+        for j = 1:i
+            Su(n*(i-1)+1:n*i,m*(i-j)+1:m*(i-j)+m) = Phi_mat^(j-1)*Gamma_mat;
+            Sdel(n*(i-1)+1:n*i,n*(i-j)+1:n*(i-j)+n) = Phi_mat^(j-1);
+        end
+    end
+    H = 2*(Su'*Wx*Su + Wu); H = (H + H')/2;
+    F = 2*(Wx*Su)'*(Sx*x_k+Sdel*Del_k-Zs);
+end
